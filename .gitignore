@@ -4,3 +4,4 @@ __pycache__/
 *.xls
 *.xlsx
 *.xlsm
+.DS_Store
