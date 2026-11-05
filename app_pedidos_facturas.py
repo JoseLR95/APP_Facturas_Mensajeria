@@ -89,23 +89,26 @@ def leer_excel(data: bytes, header):
     return pd.read_excel(io.BytesIO(data), header=header, dtype=object)
 
 
-def construir_pedidos(df):
+def construir_pedidos(df, servicio_cero_vacio=True):
     if df.shape[1] <= COL_SERVICIO:
         raise ValueError(
             f"El fichero de pedidos tiene {df.shape[1]} columnas; "
             f"se necesitan al menos {COL_SERVICIO + 1} (hasta la AY)."
         )
-    pedidos, duplicados = {}, set()
+    pedidos, conflictos = {}, set()
     for fila in df.itertuples(index=False, name=None):
-        info = (limpiar(fila[COL_CENTRO]), limpiar(fila[COL_CLIENTE]), limpiar(fila[COL_SERVICIO]))
+        campos = [limpiar(fila[COL_CENTRO]), limpiar(fila[COL_CLIENTE]), limpiar(fila[COL_SERVICIO])]
+        if servicio_cero_vacio and str(campos[2]).strip() in ("0", "0.0"):
+            campos[2] = ""
         for col in (COL_PEDIDO_A, COL_PEDIDO_I):
             clave = norm_pedido(fila[col])
             if not clave:
                 continue
-            if clave in pedidos and pedidos[clave] != info:
-                duplicados.add(clave)
-            pedidos.setdefault(clave, info)  # se queda con la primera aparición
-    return pedidos, duplicados
+            if clave not in pedidos:
+                pedidos[clave] = tuple(campos)  # se usa la primera línea del pedido
+            elif [str(x) for x in pedidos[clave]] != [str(x) for x in campos]:
+                conflictos.add(clave)  # otra línea del mismo pedido con datos distintos
+    return pedidos, conflictos
 
 
 def construir_cifs(df, col_cliente, col_cif):
@@ -145,6 +148,16 @@ def procesar_factura(nombre, data, pedidos, cifs, fila_cab):
         def escribir(r, c, v):
             ws.cell(r, c, v)
 
+    if fila_cab == 0:  # detectar: fila cuya columna C dice "Pedido"
+        fila_cab = next(
+            (r for r in range(1, min(n_filas, 20) + 1) if norm_texto(leer(r)) == "PEDIDO"), 0
+        )
+        if fila_cab == 0:
+            raise ValueError(
+                f"{nombre}: no encuentro la cabecera 'Pedido' en la columna C (primeras 20 filas). "
+                "Indica la fila de cabecera manualmente."
+            )
+
     if fila_cab > 0:
         escribir(fila_cab, FACT_COL_CENTRO, "Centro de coste")
         escribir(fila_cab, FACT_COL_CIF, "CIF cliente")
@@ -176,6 +189,7 @@ def procesar_factura(nombre, data, pedidos, cifs, fila_cab):
     wb.save(salida)
     return salida.getvalue(), {
         "Fichero": nombre,
+        "Fila cabecera": fila_cab,
         "Filas con pedido": total,
         "Completadas": encontrados,
         "Pedidos no encontrados": len(sin_pedido),
@@ -205,18 +219,29 @@ if f_cifs:
     if len(cols) < 2:
         st.error("El fichero cliente-CIF necesita al menos dos columnas.")
         st.stop()
+    def buscar(claves, defecto):
+        for i, c in enumerate(cols):
+            if any(k in norm_texto(c) for k in claves):
+                return i
+        return defecto
+
     a, b = st.columns(2)
-    col_cli = a.selectbox("Columna con el nombre del cliente", cols, index=0)
-    col_cif = b.selectbox("Columna con el CIF", cols, index=1)
+    col_cli = a.selectbox(
+        "Columna con el código de cliente (la que coincide con la columna X de pedidos)",
+        cols, index=buscar(("DEUDOR", "CODIGO", "CLIENTE"), 0),
+    )
+    col_cif = b.selectbox("Columna con el CIF", cols, index=buscar(("IDENT", "CIF", "NIF", "FIS"), min(2, len(cols) - 1)))
 
 fila_cab = st.number_input(
-    "Fila de cabecera en las facturas (los datos empiezan en la siguiente)", min_value=0, value=4, step=1
+    "Fila de cabecera en las facturas (0 = detectarla automáticamente)", min_value=0, value=0, step=1
 )
+
+servicio_cero_vacio = st.checkbox("Tratar el servicio 0 como vacío", value=True)
 
 if st.button("Procesar", type="primary", disabled=not (f_pedidos and f_cifs and f_facturas)):
     try:
         df_ped = leer_excel(f_pedidos.getvalue(), None)  # sin cabecera: se usan posiciones
-        pedidos, duplicados = construir_pedidos(df_ped)
+        pedidos, duplicados = construir_pedidos(df_ped, servicio_cero_vacio)
         cifs = construir_cifs(df_cif, col_cli, col_cif)
 
         resultados, resumen = {}, []
@@ -247,8 +272,8 @@ if res:
 
     if res["duplicados"]:
         st.warning(
-            "Pedidos repetidos en el fichero de pedidos con datos distintos "
-            f"(se usó la primera aparición): {', '.join(res['duplicados'][:30])}"
+            "Pedidos con varias líneas con datos distintos en el fichero de pedidos "
+            f"(se usó la primera línea): {', '.join(res['duplicados'][:30])}"
         )
 
     for r in res["resumen"]:
